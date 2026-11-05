@@ -41,14 +41,17 @@ class DataFeed:
             logger.error(f"Failed to fetch data for {config.SYMBOL} on {timeframe}")
             return pd.DataFrame()
             
-        # Convert to pandas DataFrame
+        return self._to_frame(rates)
+
+    @staticmethod
+    def _to_frame(rates):
+        """Builds a DataFrame and converts MT5 server time to naive UTC."""
         df = pd.DataFrame(rates)
-        # Convert time in seconds to datetime format
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        
-        # Set time as index (optional, but standard for time series)
-        # df.set_index('time', inplace=True)
-        return df
+        server_time = pd.to_datetime(df['time'], unit='s')
+        df['time'] = (server_time.dt.tz_localize(config.SERVER_TIMEZONE,
+                                                 ambiguous='NaT', nonexistent='shift_forward')
+                      .dt.tz_convert('UTC').dt.tz_localize(None))
+        return df.dropna(subset=['time']).reset_index(drop=True)
 
     def get_data_range(self, timeframe, date_from, date_to):
         """
@@ -61,9 +64,7 @@ class DataFeed:
             logger.error(f"Failed to fetch data for {config.SYMBOL} from {date_from} to {date_to}")
             return pd.DataFrame()
             
-        df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        return df
+        return self._to_frame(rates)
 
     def get_tick(self):
         """Fetches the latest tick data (Bid/Ask)."""

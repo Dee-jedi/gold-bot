@@ -1,283 +1,354 @@
-import pytz
-from datetime import datetime, timedelta
+"""
+Realistic bar-by-bar backtest for the SMC gold bot.
+
+How it mimics live trading:
+  * Signals are evaluated at the CLOSE of each LTF bar, using only HTF bars that
+    had already closed by then (no look-ahead).
+  * Orders fill at the OPEN of the next bar: BUY at ask (bid + spread + slippage),
+    SELL at bid (- slippage). Spread = that bar's MT5 spread, never below
+    the symbol's min_spread in config.SYMBOL_SPECS.
+  * Stops: BUY stop triggers on bid low, SELL stop on ask high. If price gaps
+    through the stop, the fill is the (worse) open price, plus slippage.
+  * If SL and TP are both touched inside one bar we assume the SL hit first.
+  * Lot size = equity x RISK_PERCENT / loss-per-lot at the SL, rounded DOWN to
+    0.01; trade skipped if below the minimum lot. Commission and swap applied.
+  * Trailing / breakeven updates use closed-bar data and apply from the next bar.
+
+Usage:
+  python backtest.py                         # config timeframes, fresh MT5 data
+  python backtest.py --ltf 5M --cache DIR    # use cached pickles XAUUSD_<TF>.pkl
+  python backtest.py --set USE_FVG_POI=True --set EXIT_MODE=rr
+"""
+import argparse
+import math
+import os
+from contextlib import contextmanager
+
+import numpy as np
 import pandas as pd
-import time
-from data_feed import DataFeed
-from strategy_smc import SMCStrategy
+
 import config
+from strategy_smc import SMCStrategy
 
-print("Starting Backtest Engine...")
-
-# Overrides for Backtesting
-config.HTF = "5M"
-config.LTF = "1M"
-SPREAD = 20  # points (2 pips for volatile pairs like GBPJPY)
-COMMISSION = 0  # simple
-
-data_feed = DataFeed()
-strategy = SMCStrategy(swing_length=config.SWING_LOOKBACK)
-
-# 1. Fetch Data
-print("Fetching historical data (up to 4 months/120k bars)...")
-# 98,000 bars of 1M data
-# 19,600 bars of 5M data matches the same period
-htf_df = data_feed.get_data(config.HTF, num_bars=19600)
-ltf_df = data_feed.get_data(config.LTF, num_bars=98000)
-
-data_feed.shutdown()
-
-if htf_df.empty or ltf_df.empty:
-    print("Failed to fetch data. Max bars may be limited by broker.")
-    exit()
-
-date_from = ltf_df['time'].iloc[0]
-date_to = ltf_df['time'].iloc[-1]
+TF_MIN = {"1M": 1, "3M": 3, "5M": 5, "15M": 15, "1H": 60, "1D": 1440}
+MIN_LOT, LOT_STEP = 0.01, 0.01
 
 
-
-print(f"Loaded {len(htf_df)} HTF bars and {len(ltf_df)} LTF bars.")
-
-# Pre-calculate HTF ATR for trailing stops (much wider than 1M ATR)
-htf_atr = strategy.calculate_atr(htf_df, period=config.ATR_PERIOD)
-htf_df['atr'] = htf_atr
-
-# Map HTF ATR values to LTF timestamps
-htf_atr_times = htf_df[['time', 'atr']].dropna().copy()
-
-def get_htf_atr(current_time):
-    """Get the most recent HTF ATR value for a given LTF timestamp."""
-    valid = htf_atr_times[htf_atr_times['time'] <= current_time]
-    if valid.empty:
-        return 0
-    return valid['atr'].iloc[-1]
-
-# 2. Pre-calculate HTF States to optimize simulation speed
-print("Pre-calculating HTF states (this may take a few seconds)...")
-htf_states = {}  # key: time, value: (bias, pois)
-
-for i in range(config.SWING_LOOKBACK * 2, len(htf_df)):
-    sub_htf = htf_df.iloc[:i+1].copy()
-    bias, pois = strategy.get_htf_bias_and_pois(sub_htf)
-    htf_states[htf_df['time'].iloc[i]] = (bias, pois)
-
-# Helper to get the most recent HTF state
-htf_times = pd.Series(list(htf_states.keys()))
-
-def get_htf_state(current_time):
-    valid_times = htf_times[htf_times <= current_time]
-    if valid_times.empty:
-        return "NEUTRAL", []
-    latest_time = valid_times.iloc[-1]
-    return htf_states[latest_time]
-
-def is_kill_zone(t):
-    """Check if time falls within any kill zone (London Open or NY Open)."""
-    t = t.time() if hasattr(t, 'time') else t
-    in_london = config.LONDON_OPEN_START <= t <= config.LONDON_OPEN_END
-    in_ny = config.NY_OPEN_START <= t <= config.NY_OPEN_END
-    return in_london or in_ny
-
-# 3. Simulate Execution
-print("Running simulation loop...")
-trades = []
-open_trade = None
-daily_pnl = 0.0
-current_trading_day = None
-
-for ltf_idx in range(50, len(ltf_df)):
-    current_time = ltf_df['time'].iloc[ltf_idx]
-    current_price = ltf_df['close'].iloc[ltf_idx]
-
-    # --- Daily Drawdown Circuit Breaker ---
-    trade_day = current_time.date()
-    if current_trading_day != trade_day:
-        current_trading_day = trade_day
-        daily_pnl = 0.0  # Reset daily P&L
-
-    if daily_pnl <= -config.MAX_DAILY_DRAWDOWN_PERCENT:
-        # Daily loss limit hit — don't open new trades, but still manage open ones
-        pass
-    
-    # Get the HTF ATR for trailing stop (much wider than 1M ATR)
-    htf_atr_val = get_htf_atr(current_time)
-
-    htf_bias, pois = get_htf_state(current_time)
-
-    # Manage Open Trade
-    if open_trade is not None:
-        # --- ATR Trailing Stop (using HTF ATR, only after break-even) ---
-        if htf_atr_val > 0:
-            if open_trade['type'] == 'BUY':
-                # Track highest price since entry
-                if current_price > open_trade.get('highest_since_entry', open_trade['entry_price']):
-                    open_trade['highest_since_entry'] = current_price
-                # Only start trailing after trade is at least break-even
-                if open_trade['highest_since_entry'] > open_trade['entry_price']:
-                    trail_stop = open_trade['highest_since_entry'] - (htf_atr_val * config.ATR_TRAIL_MULTIPLIER)
-                    # Only move SL up, never down
-                    if trail_stop > open_trade['sl']:
-                        open_trade['sl'] = trail_stop
-
-            elif open_trade['type'] == 'SELL':
-                # Track lowest price since entry
-                if current_price < open_trade.get('lowest_since_entry', open_trade['entry_price']):
-                    open_trade['lowest_since_entry'] = current_price
-                # Only start trailing after trade is at least break-even
-                if open_trade['lowest_since_entry'] < open_trade['entry_price']:
-                    trail_stop = open_trade['lowest_since_entry'] + (htf_atr_val * config.ATR_TRAIL_MULTIPLIER)
-                    # Only move SL down, never up
-                    if trail_stop < open_trade['sl']:
-                        open_trade['sl'] = trail_stop
-
-        # Check Stop Loss
-        if open_trade['type'] == 'BUY' and ltf_df['low'].iloc[ltf_idx] <= open_trade['sl']:
-            open_trade['exit_price'] = open_trade['sl']
-            open_trade['exit_time'] = current_time
-            entry_dist = open_trade['entry_price'] - open_trade['initial_sl']
-            if entry_dist > 0:
-                actual_dist = open_trade['exit_price'] - open_trade['entry_price']
-                total_cost = (SPREAD + config.MAX_SLIPPAGE) * 0.01
-                open_trade['pnl'] = ((actual_dist - total_cost) / entry_dist) * config.RISK_PERCENT
+@contextmanager
+def overrides(**kw):
+    """Temporarily override config values."""
+    old = {k: getattr(config, k) for k in kw if hasattr(config, k)}
+    for k, v in kw.items():
+        setattr(config, k, v)
+    try:
+        yield
+    finally:
+        for k in kw:
+            if k in old:
+                setattr(config, k, old[k])
             else:
-                open_trade['pnl'] = -config.RISK_PERCENT
-            daily_pnl += open_trade['pnl']
-            trades.append(open_trade)
-            open_trade = None
-            continue
+                delattr(config, k)
 
-        elif open_trade['type'] == 'SELL' and ltf_df['high'].iloc[ltf_idx] >= open_trade['sl']:
-            open_trade['exit_price'] = open_trade['sl']
-            open_trade['exit_time'] = current_time
-            entry_dist = open_trade['initial_sl'] - open_trade['entry_price']
-            if entry_dist > 0:
-                actual_dist = open_trade['entry_price'] - open_trade['exit_price']
-                total_cost = (SPREAD + config.MAX_SLIPPAGE) * 0.01
-                open_trade['pnl'] = ((actual_dist - total_cost) / entry_dist) * config.RISK_PERCENT
+
+def load_data(tf, cache_dir=None):
+    if cache_dir:
+        return pd.read_pickle(os.path.join(cache_dir, f"{config.SYMBOL}_{tf}.pkl"))
+    from data_feed import DataFeed
+    feed = DataFeed()
+    try:
+        return feed.get_data(tf, num_bars=99999)
+    finally:
+        feed.shutdown()
+
+
+def in_kill_zone(ts):
+    t = ts.time()
+    return (config.LONDON_OPEN_START <= t <= config.LONDON_OPEN_END or
+            config.NY_OPEN_START <= t <= config.NY_OPEN_END)
+
+
+def run_backtest(htf_df, ltf_df, htf_tf, ltf_tf, start=None, end=None,
+                 starting_equity=10_000.0, trend_df=None, **kw):
+    """Runs one backtest. Extra keyword args temporarily override config values.
+    trend_df: bars of config.TREND_TF, required when TREND_FILTER is on."""
+    with overrides(**kw):
+        return _run(htf_df, ltf_df, htf_tf, ltf_tf, start, end, starting_equity, trend_df)
+
+
+def _run(htf_df, ltf_df, htf_tf, ltf_tf, start, end, starting_equity, trend_df=None):
+    strat = SMCStrategy()
+    spec = config.SYMBOL_SPECS[config.SYMBOL]
+    POINT = spec['point']
+    comm = spec['commission']
+    htf_df = htf_df.reset_index(drop=True)
+    ltf_df = ltf_df.reset_index(drop=True)
+
+    # ---- optional big-picture trend filter, indexed by bar close time ----
+    if config.TREND_FILTER:
+        if trend_df is None:
+            raise ValueError("TREND_FILTER is on: pass trend_df (bars of config.TREND_TF)")
+        trend_df = trend_df.reset_index(drop=True)
+        trend_dir = strat.trend_direction(trend_df)
+        trend_close_t = (trend_df['time'] + pd.Timedelta(minutes=TF_MIN[config.TREND_TF])).to_numpy()
+
+    # ---- HTF: one causal pass, state indexed by HTF bar close time ----
+    bias, pois = strat.htf_structure(htf_df)
+    pois.sort(key=lambda p: p['created'])
+    htf_atr = strat.calculate_atr(htf_df).to_numpy(float)
+    htf_close_t = (htf_df['time'] + pd.Timedelta(minutes=TF_MIN[htf_tf])).to_numpy()
+
+    # ---- LTF arrays ----
+    t_open = ltf_df['time']
+    o, h, l, c = (ltf_df[k].to_numpy(float) for k in ('open', 'high', 'low', 'close'))
+    spread = np.maximum(ltf_df['spread'].to_numpy(float), spec['min_spread']) * POINT
+    if spec.get('spread_pct'):   # e.g. crypto: spread quoted as % of price
+        spread = np.maximum(spread, spec['spread_pct'] * ltf_df['close'].to_numpy(float))
+    atr = strat.calculate_atr(ltf_df).to_numpy(float)
+    ltf_len = pd.Timedelta(minutes=TF_MIN[ltf_tf])
+    decision_t = (t_open + ltf_len)
+    decision_np = decision_t.to_numpy()
+    server_day = (t_open.dt.tz_localize('UTC').dt.tz_convert(config.SERVER_TIMEZONE)
+                  .dt.tz_localize(None).dt.normalize())
+    server_day_np = server_day.to_numpy()
+    utc_day_np = t_open.dt.normalize().to_numpy()
+    slip_arr = np.full(len(ltf_df), spec['slippage'] * POINT)
+    if spec.get('slippage_pct'):
+        slip_arr = np.maximum(slip_arr, spec['slippage_pct'] * ltf_df['close'].to_numpy(float))
+    max_spread = spec.get('max_spread_points', config.MAX_SPREAD_POINTS)
+    max_spread = np.inf if max_spread is None else max_spread * POINT
+    cs = spec['contract']
+
+    i0 = 60
+    if start is not None:
+        i0 = max(i0, int(np.searchsorted(t_open.to_numpy(), np.datetime64(pd.Timestamp(start)))))
+    i1 = len(ltf_df)
+    if end is not None:
+        i1 = int(np.searchsorted(t_open.to_numpy(), np.datetime64(pd.Timestamp(end))))
+
+    equity = starting_equity
+    trades, curve = [], []
+    pos = pending = None
+    exit_next_open = False
+    used = set()
+    active, poi_ptr, hp = [], 0, -1
+    day, day_start_eq = None, equity
+
+    def close_pos(t, price, reason, frac=1.0):
+        """Close `frac` of the original lots at `price` (already incl. spread/slip)."""
+        nonlocal pos, equity
+        lots = round(pos['lots'] * frac, 2) if frac < 1 else pos['remaining']
+        lots = min(lots, pos['remaining'])
+        pnl = (price - pos['entry']) * pos['dir'] * cs * lots
+        pnl -= comm * lots
+        equity += pnl
+        pos['realized'] += pnl
+        pos['remaining'] = round(pos['remaining'] - lots, 2)
+        if pos['remaining'] <= 1e-9:
+            total = pos['realized'] + pos['swap']
+            trades.append({
+                'dir': 'BUY' if pos['dir'] > 0 else 'SELL', 'entry_time': pos['time'],
+                'exit_time': t_open.iloc[t], 'entry': pos['entry'], 'exit': price,
+                'sl0': pos['sl0'], 'lots': pos['lots'], 'pnl': total,
+                'R': total / pos['risk_usd'], 'reason': reason, 'poi': pos['poi'],
+                'poi_top': pos['poi_top'], 'poi_bottom': pos['poi_bottom'],
+                'poi_age_htf': pos['poi_age_htf'], 'equity': equity})
+            curve.append((t_open.iloc[t], equity))
+            pos = None
+
+    for t in range(i0, i1):
+        sp = spread[t]
+        slip = slip_arr[t]
+
+        # ---------------- 1. fills at this bar's OPEN ----------------
+        if pos is not None and exit_next_open:
+            close_pos(t, o[t] - slip if pos['dir'] > 0 else o[t] + sp + slip, 'bias_flip')
+            exit_next_open = False
+
+        if pending is not None:
+            d, sl, poi = pending
+            pending = None
+            entry = o[t] + sp + slip if d > 0 else o[t] - slip
+            loss_per_lot = (entry - sl) * d * cs + comm
+            if loss_per_lot > 0:
+                lots = math.floor(equity * config.RISK_PERCENT / 100 / loss_per_lot / LOT_STEP + 1e-9) * LOT_STEP
+                lots = round(lots, 2)
+                if lots >= MIN_LOT:
+                    r = abs(entry - sl)
+                    tp = None
+                    if config.EXIT_MODE in ('rr', 'partial'):
+                        tp = entry + d * config.TP_R * r
+                    pos = {'dir': d, 'entry': entry, 'sl': sl, 'sl0': sl, 'tp': tp, 'lots': lots,
+                           'remaining': lots, 'time': t_open.iloc[t], 'extreme': entry,
+                           'risk_usd': lots * loss_per_lot, 'realized': 0.0, 'swap': 0.0,
+                           'be_done': False, 'partial_done': False, 'poi': poi['kind'],
+                           'poi_top': poi['top'], 'poi_bottom': poi['bottom'],
+                           'poi_age_htf': hp - poi['created']}
+
+        # ---------------- 2. intrabar SL / TP ----------------
+        if pos is not None:
+            d = pos['dir']
+            if d > 0:
+                if l[t] <= pos['sl']:
+                    close_pos(t, min(pos['sl'], o[t]) - slip, 'sl')
+                elif pos['tp'] is not None and h[t] >= pos['tp']:
+                    if config.EXIT_MODE == 'partial' and not pos['partial_done']:
+                        close_pos(t, pos['tp'], 'tp1', frac=0.5)
+                        if pos is not None:
+                            pos['partial_done'], pos['tp'] = True, None
+                            pos['sl'] = max(pos['sl'], pos['entry'])
+                    else:
+                        close_pos(t, pos['tp'], 'tp')
             else:
-                open_trade['pnl'] = -config.RISK_PERCENT
-            daily_pnl += open_trade['pnl']
-            trades.append(open_trade)
-            open_trade = None
-            continue
+                if h[t] + sp >= pos['sl']:
+                    close_pos(t, max(pos['sl'], o[t] + sp) + slip, 'sl')
+                elif pos['tp'] is not None and l[t] + sp <= pos['tp']:
+                    if config.EXIT_MODE == 'partial' and not pos['partial_done']:
+                        close_pos(t, pos['tp'], 'tp1', frac=0.5)
+                        if pos is not None:
+                            pos['partial_done'], pos['tp'] = True, None
+                            pos['sl'] = min(pos['sl'], pos['entry'])
+                    else:
+                        close_pos(t, pos['tp'], 'tp')
 
-        # Check Dynamic Exit (HTF bias shift)
-        if open_trade['type'] == 'BUY' and htf_bias == 'BEARISH':
-            open_trade['exit_price'] = current_price
-            open_trade['exit_time'] = current_time
-            entry_dist = open_trade['entry_price'] - open_trade['initial_sl']
-            actual_dist = current_price - open_trade['entry_price']
-            total_cost = (SPREAD + config.MAX_SLIPPAGE) * 0.01
-            open_trade['pnl'] = ((actual_dist - total_cost) / entry_dist) * config.RISK_PERCENT if entry_dist > 0 else 0
-            daily_pnl += open_trade['pnl']
-            trades.append(open_trade)
-            open_trade = None
-            continue
+        # ---------------- 3. at bar CLOSE ----------------
+        # advance HTF state to the last bar closed by now
+        moved = False
+        while hp + 1 < len(htf_close_t) and htf_close_t[hp + 1] <= decision_np[t]:
+            hp += 1
+            moved = True
+        if moved:
+            while poi_ptr < len(pois) and pois[poi_ptr]['created'] <= hp:
+                active.append(pois[poi_ptr])
+                poi_ptr += 1
+            active = [p for p in active if p['dead'] > hp]
+        b = int(bias[hp]) if hp >= 0 else 0
 
-        elif open_trade['type'] == 'SELL' and htf_bias == 'BULLISH':
-            open_trade['exit_price'] = current_price
-            open_trade['exit_time'] = current_time
-            entry_dist = open_trade['initial_sl'] - open_trade['entry_price']
-            actual_dist = open_trade['entry_price'] - current_price
-            total_cost = (SPREAD + config.MAX_SLIPPAGE) * 0.01
-            open_trade['pnl'] = ((actual_dist - total_cost) / entry_dist) * config.RISK_PERCENT if entry_dist > 0 else 0
-            daily_pnl += open_trade['pnl']
-            trades.append(open_trade)
-            open_trade = None
-            continue
+        if pos is not None:
+            d = pos['dir']
+            # swap at broker rollover (server midnight), x3 on Wednesday night
+            if t + 1 < len(server_day_np) and server_day_np[t + 1] != server_day_np[t]:
+                if spec.get('swap_daily'):   # crypto: charged every night, no triple Wednesday
+                    nights = 1
+                else:
+                    nights = 3 if pd.Timestamp(server_day_np[t]).weekday() == 2 else 1
+                sw = (spec['swap_long'] if d > 0 else spec['swap_short']) * pos['remaining'] * nights
+                if spec.get('swap_pct_long') is not None:   # financing as % of position value
+                    pct = spec['swap_pct_long'] if d > 0 else spec['swap_pct_short']
+                    sw += pct * c[t] * cs * pos['remaining'] * nights
+                pos['swap'] += sw
+                equity += sw
+            r = abs(pos['entry'] - pos['sl0'])
+            pos['extreme'] = max(pos['extreme'], h[t]) if d > 0 else min(pos['extreme'], l[t] + sp)
+            fav = (pos['extreme'] - pos['entry']) * d
+            if config.BE_AT_R > 0 and not pos['be_done'] and fav >= config.BE_AT_R * r:
+                pos['sl'] = max(pos['sl'], pos['entry']) if d > 0 else min(pos['sl'], pos['entry'])
+                pos['be_done'] = True
+            trailing = config.EXIT_MODE == 'trail' or (config.EXIT_MODE == 'partial' and pos['partial_done'])
+            if trailing and fav > 0 and hp >= 0 and not np.isnan(htf_atr[hp]):
+                dist = config.ATR_TRAIL_MULTIPLIER * htf_atr[hp]
+                if d > 0:
+                    pos['sl'] = max(pos['sl'], pos['extreme'] - dist)
+                else:
+                    pos['sl'] = min(pos['sl'], pos['extreme'] + dist)
+            if config.EXIT_ON_BIAS_FLIP and b == -d:
+                exit_next_open = True
 
-    # Look for Entries (Only during kill zones AND if daily drawdown limit not hit)
-    if (open_trade is None
-        and is_kill_zone(current_time)
-        and daily_pnl > -config.MAX_DAILY_DRAWDOWN_PERCENT):
+        # daily loss limit (UTC day)
+        if day != utc_day_np[t]:
+            day, day_start_eq = utc_day_np[t], equity
+        daily_ok = (equity - day_start_eq) / day_start_eq * 100 > -config.MAX_DAILY_DRAWDOWN_PERCENT
 
-        sub_ltf = ltf_df.iloc[ltf_idx-50 : ltf_idx+1].copy()
-        signal, sl_price = strategy.check_ltf_entry(sub_ltf, htf_bias, pois)
+        if pos is None and pending is None and t + 1 < i1 and daily_ok \
+                and spread[t] <= max_spread and in_kill_zone(decision_t.iloc[t]):
+            b_entry = b
+            if config.TREND_FILTER:
+                ti = np.searchsorted(trend_close_t, decision_np[t], side='right') - 1
+                if ti < 0 or trend_dir[ti] != b:
+                    b_entry = 0
+            sig, sl, poi = strat.ltf_signal(o, h, l, c, atr, t, b_entry, active, sp, used)
+            if sig:
+                pending = (1 if sig == 'BUY' else -1, sl, poi)
+                if config.MAX_TRADES_PER_POI <= 1:
+                    used.add(poi['id'])
 
-        if signal:
-            open_trade = {
-                'type': signal,
-                'entry_time': current_time,
-                'entry_price': current_price,
-                'sl': sl_price,
-                'initial_sl': sl_price,  # Keep original SL for R-multiple calc
-                'highest_since_entry': current_price,
-                'lowest_since_entry': current_price,
-            }
+    if pos is not None:
+        close_pos(i1 - 1, c[i1 - 1] if pos['dir'] > 0 else c[i1 - 1] + spread[i1 - 1], 'end')
 
-# 4. Generate Report
-print("\n" + "=" * 50)
-print("         BACKTEST REPORT (Enhanced SMC)")
-print("=" * 50)
-print(f"Period: {date_from.date()} to {date_to.date()}")
-print(f"Strategy: {config.HTF} POI -> {config.LTF} CHoCH + Filters")
-print(f"Risk per trade: {config.RISK_PERCENT}%")
-print(f"ATR SL Buffer: {config.ATR_SL_MULTIPLIER}x | Trail: {config.ATR_TRAIL_MULTIPLIER}x")
-print(f"Kill Zones: London {config.LONDON_OPEN_START}-{config.LONDON_OPEN_END} | NY {config.NY_OPEN_START}-{config.NY_OPEN_END}")
-print(f"Premium/Discount Filter: {'ON' if config.USE_PREMIUM_DISCOUNT else 'OFF'}")
-print(f"Liquidity Sweep: {'ON' if config.REQUIRE_LIQUIDITY_SWEEP else 'OFF'} | FVG Confirm: {'ON' if config.REQUIRE_FVG else 'OFF'}")
-print(f"Daily Drawdown Limit: {config.MAX_DAILY_DRAWDOWN_PERCENT}%")
-print("-" * 50)
-print(f"Total Trades: {len(trades)}")
+    return pd.DataFrame(trades), starting_equity, strat.filter_stats
 
-if len(trades) > 0:
-    wins = [t for t in trades if t['pnl'] > 0]
-    losses = [t for t in trades if t['pnl'] <= 0]
 
-    win_rate = len(wins) / len(trades) * 100
-    total_return = sum(t['pnl'] for t in trades)
-    avg_win = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t['pnl'] for t in losses) / len(losses) if losses else 0
-    max_win = max(t['pnl'] for t in trades)
-    max_loss = min(t['pnl'] for t in trades)
+def stats(trades, starting_equity):
+    if trades is None or len(trades) == 0:
+        return {'trades': 0}
+    eq = np.concatenate([[starting_equity], trades['equity'].to_numpy()])
+    peak = np.maximum.accumulate(eq)
+    dd = ((peak - eq) / peak).max() * 100
+    wins = trades[trades['pnl'] > 0]
+    losses = trades[trades['pnl'] <= 0]
+    months = max((trades['exit_time'].iloc[-1] - trades['entry_time'].iloc[0]).days / 30.4, 1)
+    streak = cur = 0
+    for p in trades['pnl']:
+        cur = cur + 1 if p <= 0 else 0
+        streak = max(streak, cur)
+    return {
+        'trades': len(trades),
+        'per_month': round(len(trades) / months, 1),
+        'win_rate': round(len(wins) / len(trades) * 100, 1),
+        'avg_R': round(trades['R'].mean(), 2),
+        'profit_factor': round(wins['pnl'].sum() / -losses['pnl'].sum(), 2) if losses['pnl'].sum() < 0 else float('inf'),
+        'return_pct': round((eq[-1] / starting_equity - 1) * 100, 1),
+        'max_dd_pct': round(dd, 1),
+        'max_losing_streak': streak,
+    }
 
-    # Balance Simulator ($25k starting)
-    starting_balance = 25000.00
-    current_balance = starting_balance
-    for t in trades:
-        dollar_pnl = current_balance * (t['pnl'] / 100)
-        t['dollar_pnl'] = dollar_pnl
-        current_balance += dollar_pnl
-    
-    total_dollar_profit = current_balance - starting_balance
 
-    # Calculate max drawdown
-    cumulative = 0
-    peak = 0
-    max_dd = 0
-    for t in trades:
-        cumulative += t['pnl']
-        if cumulative > peak:
-            peak = cumulative
-        dd = peak - cumulative
-        if dd > max_dd:
-            max_dd = dd
+def report(trades, starting_equity, filter_stats, title):
+    print("=" * 60)
+    print(title)
+    print("=" * 60)
+    s = stats(trades, starting_equity)
+    for k, v in s.items():
+        print(f"  {k:18s} {v}")
+    if len(trades):
+        print("\n  Exit reasons:", trades['reason'].value_counts().to_dict())
+        by_m = trades.set_index('exit_time')['pnl'].resample('ME').agg(['count', 'sum'])
+        print("\n  Monthly P/L ($):")
+        for idx, row in by_m.iterrows():
+            print(f"    {idx:%Y-%m}  trades {int(row['count']):3d}  P/L {row['sum']:+10.2f}")
+    print("\n  Filter diagnostics:", filter_stats)
 
-    print(f"Wins: {len(wins)} | Losses: {len(losses)}")
-    print(f"Win Rate: {win_rate:.1f}%")
-    print(f"Total Return: {total_return:+.2f}%")
-    print(f"Avg Win: {avg_win:+.2f}% | Avg Loss: {avg_loss:+.2f}%")
-    print(f"Best Trade: {max_win:+.2f}% | Worst Trade: {max_loss:+.2f}%")
-    print(f"Max Drawdown: {max_dd:.2f}%")
 
-    if avg_loss != 0:
-        profit_factor = abs(sum(t['pnl'] for t in wins) / sum(t['pnl'] for t in losses)) if losses else float('inf')
-        print(f"Profit Factor: {profit_factor:.2f}")
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--symbol', default=config.SYMBOL)
+    ap.add_argument('--htf', default=config.HTF)
+    ap.add_argument('--ltf', default=config.LTF)
+    ap.add_argument('--cache', default=None, help='folder with cached XAUUSD_<TF>.pkl files')
+    ap.add_argument('--start', default=None)
+    ap.add_argument('--end', default=None)
+    ap.add_argument('--equity', type=float, default=10_000.0)
+    ap.add_argument('--set', action='append', default=[], help='KEY=VALUE config override')
+    ap.add_argument('--trades', action='store_true', help='print every trade')
+    a = ap.parse_args()
 
-    print("-" * 50)
-    print(f"Starting Balance: ${starting_balance:,.2f}")
-    print(f"Ending Balance:   ${current_balance:,.2f}")
-    print(f"Total Profit:     ${total_dollar_profit:+,.2f} (Compounded)")
+    ov = {}
+    for kv in a.set:
+        k, v = kv.split('=', 1)
+        try:
+            v = eval(v, {}, {})
+        except Exception:
+            pass
+        ov[k] = v
 
-    # Print individual trades
-    print("\n--- Trade Log ---")
-    for i, t in enumerate(trades, 1):
-        result = "WIN " if t['pnl'] > 0 else "LOSS"
-        print(f"  #{i:02d} [{result}] {t['type']:4s} | "
-              f"Entry: {t['entry_time']} @ {t['entry_price']:.2f} | "
-              f"Exit: {t['exit_time']} @ {t['exit_price']:.2f} | "
-              f"PnL: {t['pnl']:+.2f}% (${t['dollar_pnl']:+,.2f})")
-else:
-    print("No trades taken.")
-
-strategy.print_filter_stats()
-print("=" * 50)
+    config.SYMBOL = a.symbol.upper()
+    htf_df = load_data(a.htf, a.cache)
+    ltf_df = load_data(a.ltf, a.cache)
+    trend_df = load_data(ov.get('TREND_TF', config.TREND_TF), a.cache) \
+        if ov.get('TREND_FILTER', config.TREND_FILTER) else None
+    tr, eq0, fs = run_backtest(htf_df, ltf_df, a.htf, a.ltf, a.start, a.end, a.equity,
+                               trend_df=trend_df, **ov)
+    report(tr, eq0, fs, f"SMC backtest {config.SYMBOL} {a.htf} -> {a.ltf} | risk {config.RISK_PERCENT}% | "
+                        f"{ltf_df['time'].iloc[0]:%Y-%m-%d} .. {ltf_df['time'].iloc[-1]:%Y-%m-%d} {ov or ''}")
+    if a.trades and len(tr):
+        pd.set_option('display.width', 200)
+        print(tr[['dir', 'entry_time', 'exit_time', 'entry', 'exit', 'lots', 'pnl', 'R', 'reason', 'poi']].to_string())
