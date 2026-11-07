@@ -47,7 +47,7 @@ def fetch_day(sym, day, retries=12):
     for attempt in range(retries):
         time.sleep(PAUSE)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 raw = r.read()
             break
         except urllib.error.HTTPError as e:
